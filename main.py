@@ -1,3 +1,7 @@
+import os
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["HF_HUB_VERBOSITY"] = "error"
 import numpy as np
 import torch
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
@@ -66,6 +70,7 @@ def positional_embedding_layer(embeddings):
     return embeddings + Model.position_embeddings[:len(embeddings)]
 
 def layer_norm(embeddings, weight, bias, eps=1e-5):
+    """Normalize embeddings to counter vanishing gradients"""
     mean = np.mean(embeddings, axis=-1, keepdims=True)
     var = np.var(embeddings, axis=-1, keepdims=True)
     normalized = (embeddings - mean) / np.sqrt(var + eps)
@@ -92,21 +97,29 @@ def self_attention(x, layer_idx):
     # print(q)
 
     # casual mask is used to prevent attending to future tokens by setting them to negative infinity so softmax sets to them 0 which makes them useless in weighted sum
+    # triu makes a triangle e.g
+    #     [[0, 1, 1, 1],
+    #     [0, 0, 1, 1],
+    #     [0, 0, 0, 1],
+    #     [0, 0, 0, 0]]
+    # The ones become -1e10
     mask = np.triu(np.ones((seq_len, seq_len)), k=1) * -1e10
 
     # process each head independently, should be done in parallel but this is for learning purposes
     head_outputs = []
     for h in range(Model.N_HEAD):
         # pull out q k v for the current head, will each be (seq_len, 64)
-        q_h = q[:, h * 64 : (h + 1) * 64]
-        k_h = k[:, h * 64 : (h + 1) * 64]
-        v_h = v[:, h * 64 : (h + 1) * 64]
+        q_h = q[:, h *  Model.HEAD_DIM : (h + 1) * Model.HEAD_DIM]
+        k_h = k[:, h * Model.HEAD_DIM : (h + 1) * Model.HEAD_DIM]
+        v_h = v[:, h * Model.HEAD_DIM : (h + 1) * Model.HEAD_DIM]
 
         # attention scores: (seq_len, 64) @ (64, seq_len) = (seq_len, seq_len)
         # Q @ K for every token
-        scores = q_h @ k_h.T / np.sqrt(64)
+        scores = q_h @ k_h.T / np.sqrt(Model.HEAD_DIM)
+        # add scores to the mask, scores we aren't allowed to see will be large negative numbers as described previously
         scores = scores + mask
 
+        # get probabiliets, used for weighted sum, e.g 0.9 will mean a token attends heavily to the current token allowing it to consume more of it's V
         score_probs = softmax(scores)
 
         # weighted sum of values, tokens that attended more will have higher scores offering more of their V
@@ -123,6 +136,8 @@ def self_attention(x, layer_idx):
 
 
 def gelu(x):
+    # smoother ReLU - instead of a hard cutoff, it gradually tapers negative values toward zero
+    # https://miro.medium.com/v2/resize:fit:720/format:webp/0*jetafLazYuwIXGuH.png
     return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))
 
 
@@ -135,23 +150,34 @@ def feed_forward(x, layer_idx):
     
 
 def transformer_block(x, layer_idx):
+    # normalize the input so values are stable before attention, weights and biases are used for this normalization
     normed = layer_norm(x, Model.ln_1_weight[layer_idx], Model.ln_1_bias[layer_idx])
+
+    # each token looks at other tokens to figure out what's relevant to it building embeddings with rich context
     attn_out = self_attention(normed, layer_idx)
     
-    # residual
+    # Add the original input back - this "residual connection" lets gradients
+    # flow straight through during training and means the attention only needs
+    # to learn what to ADD to the representation, not rebuild it from scratch
     x = x + attn_out
 
-    # MLP - feed-forward using layernorm 2
+    # Normalize again before the feed-forward step
     normed = layer_norm(x, Model.ln_2_weight[layer_idx], Model.ln_2_bias[layer_idx])
+
+    # Each token independently processes its own representation through a
+    # wider hidden layer (768 -> 3072 -> 768) - this is where the network
+    # does most of its "thinking" / "understanding" about individual token meaning
     ff_out = feed_forward(normed, layer_idx)
     # residual
     x = x + ff_out
     return x
 
 
-def network(text):
+def network(text) -> int:
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     tokens = tokenizer(text)['input_ids']
+
+    # -- network part ---
     embeddings = embedding_layer(tokens)
     position_embeddings = positional_embedding_layer(embeddings)
     x = position_embeddings
@@ -162,40 +188,39 @@ def network(text):
     # Final layer norm
     x = layer_norm(x, Model.ln_f_weight, Model.ln_f_bias)
 
-    print(x.shape)
+    # print(x.shape)
 
     # project to vocabulary: (seq_len, 768) @ (768, 50257) = (seq_len, 50257)
     logits = x @ Model.word_embeddings.T
 
     # get highest scoring token
     next_token = np.argmax(logits[-1])
-
-    print(f"Next token ID: {next_token}")
-    print(f"Next token: '{tokenizer.decode(next_token)}'")
+    return next_token
 
 
-def main():
-    text = "What the"
-    network(text)
-    print()
-    # gpt2(tsext)
-
-
-def gpt2(text):
+def main(text, max_tokens):
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    model = GPT2LMHeadModel.from_pretrained("gpt2")
-    model.eval()
+    print(text, end='')
+    for _ in range(max_tokens):
+        token = network(text)
+        token_string = tokenizer.decode(token)
+        print(token_string, end='', flush=True)
+        text += tokenizer.decode(token)
 
-    tokens = tokenizer(text, return_tensors="pt")
-
-    with torch.no_grad():
-        # Grab the embedding output
-        embeds = model.transformer.wte(tokens['input_ids']) + model.transformer.wpe(torch.arange(len(tokens['input_ids'][0])))
-
-        # Run it through the first block's layer norm
-        ln_1_output = model.transformer.h[0].ln_1(embeds)
-        print("After ln_1:")
-        print(ln_1_output.numpy())
 
 if __name__ == "__main__":
-    main()
+    prompt = "What is a solar eclipse?"
+    max_tokens = 19
+    main(prompt, max_tokens)
+
+# def gpt2(text):
+#     # not used anymore, was used to understand the outputs at each layer and ensure manual network was correct
+#     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+#     model = GPT2LMHeadModel.from_pretrained("gpt2")
+#     model.eval()
+#     tokens = tokenizer(text, return_tensors="pt")
+#     with torch.no_grad():
+#         embeds = model.transformer.wte(tokens['input_ids']) + model.transformer.wpe(torch.arange(len(tokens['input_ids'][0])))
+#         ln_1_output = model.transformer.h[0].ln_1(embeds)
+#         print("After ln_1:")
+#         print(ln_1_output.numpy())
