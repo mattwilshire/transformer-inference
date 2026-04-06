@@ -1,2 +1,2 @@
 # transformer-inference
-Transformer inference from scratch - modelling GPT2.
+Transformer inference from scratch using GPT2 weights.
