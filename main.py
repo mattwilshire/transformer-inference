@@ -200,12 +200,13 @@ def network(text) -> int:
 
 def main(text, max_tokens):
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    print(text, end='')
+    print(f"Prompt: {text}", end='')
     for _ in range(max_tokens):
         token = network(text)
         token_string = tokenizer.decode(token)
         print(token_string, end='', flush=True)
         text += tokenizer.decode(token)
+    print()
 
 
 if __name__ == "__main__":
