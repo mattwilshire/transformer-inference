@@ -71,10 +71,82 @@ def layer_norm(embeddings, weight, bias, eps=1e-5):
     normalized = (embeddings - mean) / np.sqrt(var + eps)
     return weight * normalized + bias
 
+def softmax(x):
+    exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
+
+def self_attention(x, layer_idx):
+    seq_len = x.shape[0]
+
+    # one matmul to get each tokens QKV, will be (2, 2304)
+    # QKV are concatendated together so Q = 768 + K = 768 + V = 768 == 2304
+    qkv = x @ Model.attn_c_attn_weight[layer_idx] + Model.attn_c_attn_bias[layer_idx]
+
+    # print(qkv)
+    # print(qkv.shape)
+
+    # split into Q, K, V each
+    q, k, v = np.split(qkv, 3, axis=-1)
+
+    # print(q.shape)
+    # print(q)
+
+    # casual mask is used to prevent attending to future tokens by setting them to negative infinity so softmax sets to them 0 which makes them useless in weighted sum
+    mask = np.triu(np.ones((seq_len, seq_len)), k=1) * -1e10
+
+    # process each head independently, should be done in parallel but this is for learning purposes
+    head_outputs = []
+    for h in range(Model.N_HEAD):
+        # pull out q k v for the current head, will each be (seq_len, 64)
+        q_h = q[:, h * 64 : (h + 1) * 64]
+        k_h = k[:, h * 64 : (h + 1) * 64]
+        v_h = v[:, h * 64 : (h + 1) * 64]
+
+        # attention scores: (seq_len, 64) @ (64, seq_len) = (seq_len, seq_len)
+        # Q @ K for every token
+        scores = q_h @ k_h.T / np.sqrt(64)
+        scores = scores + mask
+
+        score_probs = softmax(scores)
+
+        # weighted sum of values, tokens that attended more will have higher scores offering more of their V
+        head_output = score_probs @ v_h # (seq_len, 64)
+        # print(head_output.shape)
+        head_outputs.append(head_output)
+    
+    # concatenate all heads, 12 x (seq_len, 64) -> (seq_len, 768)
+    attn_out = np.concatenate(head_outputs, axis=-1)
+    # print(attn_out.shape)
+
+    # output projection
+    return attn_out @ Model.attn_c_proj_weight[layer_idx] + Model.attn_c_proj_bias[layer_idx]
+
+
+def gelu(x):
+    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))
+
+
+def feed_forward(x, layer_idx):
+    # expands (seq_len, 768) @ (768, 3072) = (seq_len, 3072)
+    hidden = x @ Model.mlp_c_fc_weight[layer_idx] + Model.mlp_c_fc_bias[layer_idx]
+    hidden = gelu(hidden)
+    # project back (seq_len, 3072) @ (3072, 768) = (seq_len, 768)
+    return hidden @ Model.mlp_c_proj_weight[layer_idx] + Model.mlp_c_proj_bias[layer_idx]
+    
+
 def transformer_block(x, layer_idx):
     normed = layer_norm(x, Model.ln_1_weight[layer_idx], Model.ln_1_bias[layer_idx])
-    print(normed)
-    pass
+    attn_out = self_attention(normed, layer_idx)
+    
+    # residual
+    x = x + attn_out
+
+    # MLP - feed-forward using layernorm 2
+    normed = layer_norm(x, Model.ln_2_weight[layer_idx], Model.ln_2_bias[layer_idx])
+    ff_out = feed_forward(normed, layer_idx)
+    # residual
+    x = x + ff_out
+    return x
 
 
 def network(text):
@@ -82,17 +154,31 @@ def network(text):
     tokens = tokenizer(text)['input_ids']
     embeddings = embedding_layer(tokens)
     position_embeddings = positional_embedding_layer(embeddings)
+    x = position_embeddings
 
     for layer_idx in range(Model.N_LAYER):
-        transformer_block(position_embeddings, layer_idx)
-        break
+        x = transformer_block(x, layer_idx)
+    
+    # Final layer norm
+    x = layer_norm(x, Model.ln_f_weight, Model.ln_f_bias)
+
+    print(x.shape)
+
+    # project to vocabulary: (seq_len, 768) @ (768, 50257) = (seq_len, 50257)
+    logits = x @ Model.word_embeddings.T
+
+    # get highest scoring token
+    next_token = np.argmax(logits[-1])
+
+    print(f"Next token ID: {next_token}")
+    print(f"Next token: '{tokenizer.decode(next_token)}'")
 
 
 def main():
     text = "What the"
     network(text)
     print()
-    gpt2(text)
+    # gpt2(tsext)
 
 
 def gpt2(text):
